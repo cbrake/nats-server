@@ -67,6 +67,9 @@ const (
 	mqttSubscribeFlags = byte(0x2)
 	mqttSubAckFailure  = byte(0x80)
 
+	// Unsubscribe flags
+	mqttUnsubscribeFlags = byte(0x2)
+
 	// ConnAck returned codes
 	mqttConnAckRCConnectionAccepted          = byte(0x0)
 	mqttConnAckRCUnacceptableProtocolVersion = byte(0x1)
@@ -79,6 +82,11 @@ const (
 	mqttTopicLevelSep = '/'
 	mqttSingleLevelWC = '+'
 	mqttMultiLevelWC  = '#'
+
+	// This is appended to the sid of a subscription that is
+	// created on the upper level subject because of the MQTT
+	// wildcard '#' semantic.
+	mqttMultiLevelSidSuffix = " fwc"
 )
 
 var (
@@ -97,7 +105,6 @@ type srvMQTT struct {
 type mqtt struct {
 	r     *mqttReader
 	cp    *mqttConnectProto
-	sid   uint32
 	sessp bool // session present
 }
 
@@ -244,7 +251,6 @@ func (c *client) mqttParse(buf []byte) error {
 	var err error
 	var b byte
 	var pl int
-	var flush bool
 
 	for err == nil && r.hasMore() {
 
@@ -284,7 +290,6 @@ func (c *client) mqttParse(buf []byte) error {
 					if trace {
 						c.traceOutOp("PUBACK", []byte(fmt.Sprintf("pi=%v", pp.pi)))
 					}
-					flush = true
 				}
 			}
 		case mqttPacketPubAck:
@@ -302,18 +307,26 @@ func (c *client) mqttParse(buf []byte) error {
 				c.traceInOp("SUBSCRIBE", errOrTrace(err, mqttSubscribeTrace(filters)))
 			}
 			if err == nil {
-				c.mqttProcessSubs(mqtt, pi, filters)
+				c.mqttProcessSubs(mqtt, filters)
 				if trace {
 					c.traceOutOp("SUBACK", []byte(mqttSubscribeTrace(filters)))
 				}
 				c.mqttEnqueueSubAck(pi, filters)
-				flush = true
 			}
-		// case mqttPacketUnsub:
-		// if p, err = pkg.ParseUnsubscribe(r, b, rl); err == nil {
-		// 	c.Debug("received", p)
-		// 	c.natsUnsubscribe(p.(*pkg.Unsubscribe))
-		// }
+		case mqttPacketUnsub:
+			var pi uint16 // packet identifier
+			var filters []*mqttFilter
+			pi, filters, err = c.mqttParseUnsubs(r, b, pl)
+			if trace {
+				c.traceInOp("UNSUBSCRIBE", errOrTrace(err, mqttUnsubscribeTrace(filters)))
+			}
+			if err == nil {
+				c.mqttProcessUnsubs(mqtt, filters)
+				if trace {
+					c.traceOutOp("UNSUBACK", []byte(strconv.FormatInt(int64(pi), 10)))
+				}
+				c.mqttEnqueueUnsubAck(pi)
+			}
 		case mqttPacketPing:
 			if trace {
 				c.traceInOp("PINGREQ", nil)
@@ -373,11 +386,6 @@ func (c *client) mqttParse(buf []byte) error {
 		default:
 			err = fmt.Errorf("received unknown packet type %d", pt>>4)
 		}
-	}
-	if flush {
-		c.mu.Lock()
-		c.flushSignal()
-		c.mu.Unlock()
 	}
 	if err == nil && rd > 0 {
 		r.reader.SetReadDeadline(time.Now().Add(rd))
@@ -589,8 +597,7 @@ func (c *client) mqttEnqueueConnAck(rc byte) {
 	if c.mqtt.sessp {
 		proto[2] = 1
 	}
-	c.queueOutbound(proto[:])
-	c.flushSignal()
+	c.enqueueProto(proto[:])
 	c.mu.Unlock()
 }
 
@@ -704,9 +711,21 @@ func (c *client) mqttEnqueuePubAck(pi uint16) {
 //////////////////////////////////////////////////////////////////////////////
 
 func (c *client) mqttParseSubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFilter, error) {
-	// Spec [MQTT-3.8.1-1]
-	if rf := b & 0xf; rf != mqttSubscribeFlags {
-		return 0, nil, fmt.Errorf("wrong subscribe reserved flags: %x", rf)
+	return c.mqttParseSubsOrUnsubs(r, b, pl, true)
+}
+
+func (c *client) mqttParseSubsOrUnsubs(r *mqttReader, b byte, pl int, sub bool) (uint16, []*mqttFilter, error) {
+	var expectedFlag byte
+	var action string
+	if sub {
+		expectedFlag = mqttSubscribeFlags
+	} else {
+		expectedFlag = mqttUnsubscribeFlags
+		action = "un"
+	}
+	// Spec [MQTT-3.8.1-1], [MQTT-3.10.1-1]
+	if rf := b & 0xf; rf != expectedFlag {
+		return 0, nil, fmt.Errorf("wrong %ssubscribe reserved flags: %x", action, rf)
 	}
 	if err := r.ensurePacketInBuffer(pl); err != nil {
 		return 0, nil, err
@@ -725,7 +744,7 @@ func (c *client) mqttParseSubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFi
 		if err != nil {
 			return 0, nil, err
 		}
-		// Spec [MQTT-3.8.3-1]
+		// Spec [MQTT-3.8.3-1], [MQTT-3.10.3-1]
 		if !utf8.Valid(filter) {
 			return 0, nil, fmt.Errorf("invalid utf8 for topic filter %q", filter)
 		}
@@ -734,19 +753,22 @@ func (c *client) mqttParseSubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFi
 		if err != nil {
 			return 0, nil, err
 		}
-		qos, err := r.readByte("QoS")
-		if err != nil {
-			return 0, nil, err
-		}
-		// Spec [MQTT-3-8.3-4].
-		if qos > 2 {
-			return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
+		var qos byte
+		if sub {
+			qos, err = r.readByte("QoS")
+			if err != nil {
+				return 0, nil, err
+			}
+			// Spec [MQTT-3-8.3-4].
+			if qos > 2 {
+				return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
+			}
 		}
 		filters = append(filters, &mqttFilter{filter, cp, qos})
 	}
-	// Spec [MQTT-3.8.3-3]
+	// Spec [MQTT-3.8.3-3], [MQTT-3.10.3-2]
 	if len(filters) == 0 {
-		return 0, nil, fmt.Errorf("subscribe protocol must contain at least 1 topic filter")
+		return 0, nil, fmt.Errorf("%ssubscribe protocol must contain at least 1 topic filter", action)
 	}
 	return pi, filters, nil
 }
@@ -780,10 +802,7 @@ func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, ms
 	csub := sub.client
 	csub.mu.Lock()
 	csub.queueOutbound(w.Bytes())
-	if _, ok := producer.pcd[csub]; !ok {
-		csub.out.fsp++
-		producer.pcd[csub] = needFlush
-	}
+	producer.addToPCD(csub)
 	if csub.trace {
 		pp := mqttPublish{
 			flags:   flags,
@@ -805,25 +824,21 @@ func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, ms
 // which I read as the replacement cannot be a "remove then add" if there
 // is a chance that in between the 2 actions, published messages
 // would be "lost" because there would not be any matching subscription.
-func (c *client) mqttProcessSubs(mqtt *mqtt, pi uint16, filters []*mqttFilter) {
+func (c *client) mqttProcessSubs(mqtt *mqtt, filters []*mqttFilter) {
 	for _, f := range filters {
 		if f.qos > 1 {
 			f.qos = 1
 		}
-		mqtt.sid++
 		subject := f.filter
 		if !f.copied {
 			subject = copyBytes(f.filter)
 		}
 		so := subOpts{
 			subject: subject,
-			key:     subject,
-			sid:     []byte(strconv.FormatInt(int64(mqtt.sid), 10)),
+			sid:     subject,
 			icb:     mqttDeliverMsgCb,
 			qos:     f.qos,
 		}
-
-	CREATE_SUB:
 		sub, err := c.processSubWithOpts(&so)
 		if sub == nil || err != nil {
 			if err == nil {
@@ -833,18 +848,24 @@ func (c *client) mqttProcessSubs(mqtt *mqtt, pi uint16, filters []*mqttFilter) {
 			f.qos = mqttSubAckFailure
 			continue
 		}
-		if len(so.subject) > 1 && so.subject[len(so.subject)-1] == fwc {
-			var _rkey [1024]byte
-			var key []byte
-
-			mqtt.sid++
+		if mqttNeedSubForLevelUp(so.subject) {
+			// Say subject is "foo.>", remove the ".>" so that it becomes "foo"
 			so.subject = so.subject[:len(so.subject)-2]
-			key = _rkey[:0]
-			key = append(key, so.subject...)
-			key = append(key, " fwc"...)
-			so.key = key
-			so.sid = []byte(strconv.FormatInt(int64(mqtt.sid), 10))
-			goto CREATE_SUB
+			// Change the sid to say "foo fwc"
+			sid := so.subject
+			sid = append(sid, mqttMultiLevelSidSuffix...)
+			so.sid = sid
+			ssub, err := c.processSubWithOpts(&so)
+			if ssub == nil || err != nil {
+				if err == nil {
+					err = fmt.Errorf("malformed subject")
+				}
+				c.Errorf("error subscribing to %q: err=%v", subject, err)
+				f.qos = mqttSubAckFailure
+				// Try to undo subscription on the ".>"
+				c.processUnsub(subject)
+				continue
+			}
 		}
 	}
 }
@@ -859,8 +880,57 @@ func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
 		w.WriteByte(f.qos)
 	}
 	c.mu.Lock()
-	c.queueOutbound(w.Bytes())
+	c.enqueueProto(w.Bytes())
 	c.mu.Unlock()
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//
+// UNSUBSCRIBE related functions
+//
+//////////////////////////////////////////////////////////////////////////////
+
+func (c *client) mqttParseUnsubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFilter, error) {
+	return c.mqttParseSubsOrUnsubs(r, b, pl, false)
+}
+
+func (c *client) mqttProcessUnsubs(mqtt *mqtt, filters []*mqttFilter) {
+	for _, f := range filters {
+		sid := f.filter
+		if err := c.processUnsub(sid); err != nil {
+			c.Errorf("error unsubscribing from %q: %v", sid, err)
+		}
+		if mqttNeedSubForLevelUp(sid) {
+			subject := sid[:len(sid)-2]
+			sid = append(subject, mqttMultiLevelSidSuffix...)
+			if err := c.processUnsub(sid); err != nil {
+				c.Errorf("error unsubscribing from %q: %v", subject, err)
+			}
+		}
+	}
+}
+
+func (c *client) mqttEnqueueUnsubAck(pi uint16) {
+	w := &mqttWriter{}
+	w.WriteByte(mqttPacketUnsubAck)
+	w.WriteVarInt(2)
+	w.WriteUint16(pi)
+	c.mu.Lock()
+	c.enqueueProto(w.Bytes())
+	c.mu.Unlock()
+}
+
+func mqttUnsubscribeTrace(filters []*mqttFilter) string {
+	var sep string
+	trace := "["
+	for i, f := range filters {
+		trace += sep + fmt.Sprintf("%s", f.filter)
+		if i == 0 {
+			sep = ", "
+		}
+	}
+	trace += "]"
+	return trace
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -871,8 +941,7 @@ func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
 
 func (c *client) mqttEnqueuePingResp() {
 	c.mu.Lock()
-	c.queueOutbound(mqttPingResponse)
-	c.flushSignal()
+	c.enqueueProto(mqttPingResponse)
 	c.mu.Unlock()
 }
 
@@ -1008,6 +1077,18 @@ func mqttFromNATSPubSubject(subject string) []byte {
 		}
 	}
 	return topic
+}
+
+// Returns true if the subject has more than 1 token and ends with ".>"
+func mqttNeedSubForLevelUp(subject []byte) bool {
+	if len(subject) < 3 {
+		return false
+	}
+	end := len(subject)
+	if subject[end-2] == '.' && subject[end-1] == fwc {
+		return true
+	}
+	return false
 }
 
 //////////////////////////////////////////////////////////////////////////////

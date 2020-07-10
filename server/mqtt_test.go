@@ -1226,9 +1226,6 @@ func TestMQTTSubDups(t *testing.T) {
 	s := RunServer(o)
 	defer s.Shutdown()
 
-	nc := natsConnect(t, s.ClientURL())
-	defer nc.Close()
-
 	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer mcp.Close()
 	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
@@ -1374,6 +1371,101 @@ func TestMQTTSubPropagation(t *testing.T) {
 
 	natsPub(t, nc, "foo", []byte("NATS"))
 	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("NATS"))
+}
+
+func testMQTTUnsub(t *testing.T, pi uint16, c net.Conn, r *mqttReader, filters []*mqttFilter) {
+	t.Helper()
+	w := &mqttWriter{}
+	pkLen := 2 // for pi
+	for i := 0; i < len(filters); i++ {
+		f := filters[i]
+		pkLen += 2 + len(f.filter)
+	}
+	w.WriteByte(mqttPacketUnsub | mqttUnsubscribeFlags)
+	w.WriteVarInt(pkLen)
+	w.WriteUint16(pi)
+	for i := 0; i < len(filters); i++ {
+		f := filters[i]
+		w.WriteBytes(f.filter)
+	}
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing UNSUBSCRIBE protocol: %v", err)
+	}
+	// Make sure we have at least 1 byte in buffer (if not will read)
+	testMQTTReaderHasAtLeastOne(t, r)
+	// Parse UNSUBACK
+	b, err := r.readByte("packet type")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pt := b & mqttPacketMask; pt != mqttPacketUnsubAck {
+		t.Fatalf("Expected UNSUBACK packet %x, got %x", mqttPacketUnsubAck, pt)
+	}
+	pl, err := r.readPacketLen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ensurePacketInBuffer(pl); err != nil {
+		t.Fatal(err)
+	}
+	rpi, err := r.readUint16("packet identifier")
+	if err != nil || rpi != pi {
+		t.Fatalf("Error with packet identifier expected=%v got: %v err=%v", pi, rpi, err)
+	}
+}
+
+func TestMQTTUnsub(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{user: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("foo"), qos: 0}}, []byte{0})
+	testMQTTFlush(t, mc, nil, r)
+
+	// Publish and test msg received
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("msg"))
+
+	// Unsubscribe
+	testMQTTUnsub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("foo")}})
+
+	// Publish and test msg not received
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo", 0, []byte("msg"))
+	testMQTTExpectNothing(t, r)
+
+	// Use of wildcards subs
+	filters := []*mqttFilter{
+		&mqttFilter{filter: []byte("foo/bar"), qos: 0},
+		&mqttFilter{filter: []byte("foo/#"), qos: 0},
+	}
+	testMQTTSub(t, 1, mc, r, filters, []byte{0, 0})
+	testMQTTFlush(t, mc, nil, r)
+
+	// Publish and check that message received twice
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo/bar", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo/bar", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo/bar", 0, []byte("msg"))
+
+	// Unsub the wildcard one
+	testMQTTUnsub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("foo/#")}})
+	// Publish and check that message received once
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo/bar", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo/bar", 0, []byte("msg"))
+	testMQTTExpectNothing(t, r)
+
+	// Unsub last
+	testMQTTUnsub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("foo/bar")}})
+	// Publish and test msg not received
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo/bar", 0, []byte("msg"))
+	testMQTTExpectNothing(t, r)
 }
 
 func testMQTTExpectDisconnect(t testing.TB, c net.Conn) {

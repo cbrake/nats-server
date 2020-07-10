@@ -2107,7 +2107,6 @@ type subOpts struct {
 	subject   []byte
 	queue     []byte
 	sid       []byte
-	key       []byte
 	noForward bool
 	icb       msgHandler
 	qos       byte
@@ -2132,7 +2131,6 @@ func (c *client) processSub(argo []byte, noForward bool) (*subscription, error) 
 	default:
 		return nil, fmt.Errorf("processSub Parse Error: '%s'", arg)
 	}
-	sub.key = sub.sid
 	return c.processSubWithOpts(&sub)
 }
 
@@ -2155,7 +2153,7 @@ func (c *client) processSubWithOpts(o *subOpts) (*subscription, error) {
 	acc := c.acc
 	srv := c.srv
 
-	key := string(o.key)
+	sid := string(o.sid)
 
 	// This check does not apply to SYSTEM or JETSTREAM or ACCOUNT clients (because they don't have a `nc`...)
 	if c.isClosed() && (kind != SYSTEM && kind != JETSTREAM && kind != ACCOUNT) {
@@ -2196,13 +2194,13 @@ func (c *client) processSubWithOpts(o *subOpts) (*subscription, error) {
 	var err error
 
 	// Subscribe here.
-	es := c.subs[key]
+	es := c.subs[sid]
 	if es == nil {
-		c.subs[key] = sub
+		c.subs[sid] = sub
 		if acc != nil && acc.sl != nil {
 			err = acc.sl.Insert(sub)
 			if err != nil {
-				delete(c.subs, key)
+				delete(c.subs, sid)
 			} else {
 				updateGWs = c.srv.gateway.enabled
 			}

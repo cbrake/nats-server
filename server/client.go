@@ -239,8 +239,9 @@ type client struct {
 
 	flags clientFlag // Compact booleans into a single field. Size will be increased when needed.
 
-	trace bool
-	echo  bool
+	trace       bool
+	echo        bool
+	clusterName string
 }
 
 type rrTracking struct {

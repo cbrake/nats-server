@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nuid"
 )
 
 // FlagSnapshot captures the server options as specified by CLI flags at
@@ -54,9 +55,13 @@ type option interface {
 	// cluster permissions.
 	IsClusterPermsChange() bool
 
-	// IsJetStreamChange inidicates a change in the servers config for JetStream.
+	// IsJetStreamChange indicates a change in the servers config for JetStream.
 	// Account changes will be handled separately in reloadAuthorization.
 	IsJetStreamChange() bool
+
+	// IsClusterNameChange indicates that the cluster name has changed which might
+	// implicate changes in the cluster membership of the server.
+	IsClusterNameChange() bool
 }
 
 // noopOption is a base struct that provides default no-op behaviors.
@@ -79,6 +84,10 @@ func (n noopOption) IsClusterPermsChange() bool {
 }
 
 func (n noopOption) IsJetStreamChange() bool {
+	return false
+}
+
+func (n noopOption) IsClusterNameChange() bool {
 	return false
 }
 
@@ -292,8 +301,10 @@ func (u *nkeysOption) Apply(server *Server) {
 // clusterOption implements the option interface for the `cluster` setting.
 type clusterOption struct {
 	authOption
+	oldValue     ClusterOpts
 	newValue     ClusterOpts
 	permsChanged bool
+	nameChanged  bool
 }
 
 // Apply the cluster change.
@@ -313,10 +324,21 @@ func (c *clusterOption) Apply(s *Server) {
 	}
 	s.setRouteInfoHostPortAndIP()
 	s.mu.Unlock()
-	if c.newValue.Name != "" && c.newValue.Name != s.ClusterName() {
+
+	// Check whether the cluster name has been removed or changed as that could affect a cluster membership.
+	switch {
+	case c.oldValue.Name != "" && c.newValue.Name == "":
+		// NOTE: If this node is still part of the static routes from a node that has an explicit cluster name
+		// then this new generated dynamic name will be overridden by the remote one when it sends CONNECT again.
+		s.setClusterName(nuid.Next())
+		c.nameChanged = true
+	case c.newValue.Name != "" && c.oldValue.Name != c.newValue.Name:
+		// Use the new explicit cluster name from the config.
 		s.setClusterName(c.newValue.Name)
+		c.nameChanged = true
 	}
 	s.Noticef("Reloaded: cluster")
+
 	if tlsRequired && c.newValue.TLSConfig.InsecureSkipVerify {
 		s.Warnf(clusterTLSInsecureWarning)
 	}
@@ -324,6 +346,10 @@ func (c *clusterOption) Apply(s *Server) {
 
 func (c *clusterOption) IsClusterPermsChange() bool {
 	return c.permsChanged
+}
+
+func (c *clusterOption) IsClusterNameChange() bool {
+	return c.nameChanged
 }
 
 // routesOption implements the option interface for the cluster `routes`
@@ -847,7 +873,7 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 				return nil, err
 			}
 			permsChanged := !reflect.DeepEqual(newClusterOpts.Permissions, oldClusterOpts.Permissions)
-			diffOpts = append(diffOpts, &clusterOption{newValue: newClusterOpts, permsChanged: permsChanged})
+			diffOpts = append(diffOpts, &clusterOption{oldValue: oldClusterOpts, newValue: newClusterOpts, permsChanged: permsChanged})
 		case "routes":
 			add, remove := diffRoutes(oldValue.([]*url.URL), newValue.([]*url.URL))
 			diffOpts = append(diffOpts, &routesOption{add: add, remove: remove})
@@ -1018,6 +1044,7 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		reloadAuth         = false
 		reloadClusterPerms = false
 		reloadClientTrcLvl = false
+		reloadClusterName  = false
 	)
 	for _, opt := range opts {
 		opt.Apply(s)
@@ -1033,6 +1060,9 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 		if opt.IsClusterPermsChange() {
 			reloadClusterPerms = true
 		}
+		if opt.IsClusterNameChange() {
+			reloadClusterName = true
+		}
 	}
 
 	if reloadLogging {
@@ -1046,6 +1076,9 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 	}
 	if reloadClusterPerms {
 		s.reloadClusterPermissions(ctx.oldClusterPerms)
+	}
+	if reloadClusterName {
+		s.reloadClusterName()
 	}
 
 	s.Noticef("Reloaded server configuration")
@@ -1097,6 +1130,33 @@ func (s *Server) reloadClientTraceLevel() {
 		c.mu.Lock()
 		c.setTraceLevel()
 		c.mu.Unlock()
+	}
+}
+
+// reloadClusterName detects cluster membership changes triggered
+// due to a reload where the name changes.
+func (s *Server) reloadClusterName() {
+	var (
+		routesa [64]*client
+		routes  = routesa[:0]
+	)
+
+	s.mu.Lock()
+
+	// Get all connected routes.
+	for _, route := range s.routes {
+		route.mu.Lock()
+		isClusterMember := route.clusterName == s.info.Cluster
+		if !isClusterMember {
+			routes = append(routes, route)
+		}
+		route.mu.Unlock()
+	}
+	s.mu.Unlock()
+
+	// Give up the lock before starting to disconnect.
+	for _, route := range routes {
+		route.closeConnection(ClusterNameConflict)
 	}
 }
 

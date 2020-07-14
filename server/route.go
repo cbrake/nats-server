@@ -1917,6 +1917,7 @@ func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error
 	c.route.lnoc = proto.LNOC
 	c.setRoutePermissions(perms)
 	c.headers = supportsHeaders && proto.Headers
+	c.clusterName = proto.Cluster
 	c.mu.Unlock()
 	return nil
 }

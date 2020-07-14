@@ -1652,7 +1652,8 @@ func TestConfigReloadClusterAdvertise(t *testing.T) {
 
 	orgClusterPort := s.ClusterAddr().Port
 
-	verify := func(expectedHost string, expectedPort int, expectedIP string) {
+	verify := func(t *testing.T, expectedHost string, expectedPort int, expectedIP string) {
+		t.Helper()
 		s.mu.Lock()
 		routeInfo := s.routeInfo
 		routeInfoJSON := Info{}
@@ -1679,7 +1680,7 @@ func TestConfigReloadClusterAdvertise(t *testing.T) {
 		cluster_advertise: "me:1"
 	}
 	`)
-	verify("me", 1, "nats-route://me:1/")
+	verify(t, "me", 1, "nats-route://me:1/")
 
 	// Update config with cluster_advertise (no port specified)
 	reloadUpdateConfig(t, s, conf, `
@@ -1689,7 +1690,7 @@ func TestConfigReloadClusterAdvertise(t *testing.T) {
 		cluster_advertise: "me"
 	}
 	`)
-	verify("me", orgClusterPort, fmt.Sprintf("nats-route://me:%d/", orgClusterPort))
+	verify(t, "me", orgClusterPort, fmt.Sprintf("nats-route://me:%d/", orgClusterPort))
 
 	// Update config with cluster_advertise (-1 port specified)
 	reloadUpdateConfig(t, s, conf, `
@@ -1699,7 +1700,7 @@ func TestConfigReloadClusterAdvertise(t *testing.T) {
 		cluster_advertise: "me:-1"
 	}
 	`)
-	verify("me", orgClusterPort, fmt.Sprintf("nats-route://me:%d/", orgClusterPort))
+	verify(t, "me", orgClusterPort, fmt.Sprintf("nats-route://me:%d/", orgClusterPort))
 
 	// Update to remove cluster_advertise
 	reloadUpdateConfig(t, s, conf, `
@@ -1708,7 +1709,7 @@ func TestConfigReloadClusterAdvertise(t *testing.T) {
 		listen: "0.0.0.0:-1"
 	}
 	`)
-	verify("0.0.0.0", orgClusterPort, "")
+	verify(t, "0.0.0.0", orgClusterPort, "")
 }
 
 func TestConfigReloadClusterNoAdvertise(t *testing.T) {
@@ -1784,6 +1785,183 @@ func TestConfigReloadClusterName(t *testing.T) {
 
 	if s.ClusterName() != "xyz" {
 		t.Fatalf("Expected update clustername of \"xyz\", got %q", s.ClusterName())
+	}
+}
+
+func TestConfigReloadClusterMembershipReload(t *testing.T) {
+	s1, _, conf1 := runReloadServerWithContent(t, []byte(`
+	listen: "0.0.0.0:-1"
+        server_name: "A"
+
+	cluster: {
+          listen: "0.0.0.0:-1"
+	}
+	`))
+	defer os.Remove(conf1)
+	defer s1.Shutdown()
+
+	got := s1.ClusterName()
+	if got == "" {
+		t.Fatalf("Expected update clustername to be set dynamically")
+	}
+
+	// Update config with a new cluster name.
+	reloadUpdateConfig(t, s1, conf1, `
+        listen: "0.0.0.0:-1"
+        server_name: "A"
+
+        cluster: {
+          name: "AB"
+          listen: "0.0.0.0:-1"
+        }
+        `)
+	if s1.ClusterName() != "AB" {
+		t.Fatalf("Expected update clustername of \"AB\", got %q", s1.ClusterName())
+	}
+
+	// Server B joins with the new name and joins AB.
+	template := fmt.Sprintf(`
+	listen: "0.0.0.0:-1"
+        server_name: "B"
+
+	cluster: {
+          name: "AB"
+          listen: "0.0.0.0:-1"
+          routes: [ nats://localhost:%d ]
+	}
+	`, s1.ClusterAddr().Port)
+
+	s2, _, conf2 := runReloadServerWithContent(t, []byte(template))
+	defer os.Remove(conf2)
+	defer s2.Shutdown()
+
+	// After the reload both become part of AB cluster.
+	checkClusterFormed(t, s1, s2)
+
+	// Try to send a request across the cluster with two connections.
+	addr1 := s1.Addr().(*net.TCPAddr)
+	endpoint1 := fmt.Sprintf("nats://%s:%d", "127.0.0.1", addr1.Port)
+	nc1, err := nats.Connect(endpoint1)
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer nc1.Close()
+
+	addr2 := s2.Addr().(*net.TCPAddr)
+	endpoint2 := fmt.Sprintf("nats://%s:%d", "127.0.0.1", addr2.Port)
+	nc2, err := nats.Connect(endpoint2)
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer nc2.Close()
+
+	// Make a request to confirm that clustering works on reload.
+	nc1.Subscribe("foo", func(m *nats.Msg) {
+		m.Respond([]byte("OK"))
+	})
+	nc1.Flush()
+
+	_, err = nc2.Request("foo", []byte("bar"), 2*time.Second)
+	if err != nil {
+		t.Fatalf("Error making request to cluster, got: %s", err)
+	}
+
+	// Now remove the cluster name of first server with a reload,
+	// and back to using a dynamic one.
+	//
+	// In order to do that we need to first remove the static
+	// routes from the other members of the AB cluster otherwise,
+	// the A node will go back to using the AB cluster name
+	// because of the static route CONNECT.
+	reloadUpdateConfig(t, s2, conf2, `
+        listen: "0.0.0.0:-1"
+        server_name: "B"
+
+        cluster: {
+          name: "AB"       
+          listen: "0.0.0.0:-1"
+        }
+        `)
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		if numRoutes := s1.NumRoutes(); numRoutes < 1 {
+			return fmt.Errorf("Expected %d routes for server %q, got %d", 0, s1.ID(), numRoutes)
+		}
+		return nil
+	})
+
+	// Now remove the cluster name and go back to dynamic.
+	reloadUpdateConfig(t, s1, conf1, `
+        listen: "0.0.0.0:-1"
+        server_name: "A"
+
+        cluster: {
+          listen: "0.0.0.0:-1"
+        }
+        `)
+
+	got = s1.ClusterName()
+	if got == "AB" || got == "" {
+		t.Fatalf("Expected update cluster name to be new, got %q", got)
+	}
+
+	// Make another request, which should fail since membership has changed now.
+	_, err = nc2.Request("foo", []byte("bar"), 2*time.Second)
+	if err == nil {
+		t.Fatalf("Expected error making a request to cluster.")
+	}
+
+	// Confirm that there are no routes to both servers.
+	if numRoutes := s1.NumRoutes(); numRoutes != 0 {
+		t.Fatalf("Expected no routes for server %q, got %d", s1.ID(), numRoutes)
+	}
+	if numRoutes := s2.NumRoutes(); numRoutes != 0 {
+		t.Fatalf("Expected no routes for server %q, got %d", s2.ID(), numRoutes)
+	}
+
+	// Add new node that tries to join with node A using a dynamic cluster name
+	// which will become renegotiated.
+	template = fmt.Sprintf(`
+	listen: "0.0.0.0:-1"
+        server_name: "C"
+
+	cluster: {
+          listen: "0.0.0.0:-1"
+          routes: [ nats://localhost:%d ]
+	}
+	`, s1.ClusterAddr().Port)
+
+	s3, _, conf3 := runReloadServerWithContent(t, []byte(template))
+	defer os.Remove(conf3)
+	defer s3.Shutdown()
+
+	// Connect to node with the new name.
+	addr3 := s3.Addr().(*net.TCPAddr)
+	endpoint3 := fmt.Sprintf("nats://%s:%d", "127.0.0.1", addr3.Port)
+	nc3, err := nats.Connect(endpoint3)
+	if err != nil {
+		t.Fatalf("Error creating client: %v", err)
+	}
+	defer nc3.Close()
+
+	// Wait for cluster routes to be renegotiated.
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		if numRoutes := s1.NumRoutes(); numRoutes < 1 {
+			return fmt.Errorf("Expected %d routes for server %q, got %d", 0, s1.ID(), numRoutes)
+		}
+		return nil
+	})
+
+	if s1.ClusterName() != s3.ClusterName() {
+		t.Fatalf("Expected cluster names to be the same: %s != %s", s1.ClusterName(), s3.ClusterName())
+	}
+
+	if s2.ClusterName() == s3.ClusterName() {
+		t.Fatalf("Expected cluster names to not be the same: %s == %s", s1.ClusterName(), s3.ClusterName())
+	}
+
+	_, err = nc3.Request("foo", []byte("bar"), 2*time.Second)
+	if err != nil {
+		t.Fatalf("Error making request to cluster, got: %s", err)
 	}
 }
 

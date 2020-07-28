@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -1686,6 +1687,14 @@ func (s *Server) acceptConnections(l net.Listener, acceptName string, createFunc
 				break
 			}
 			continue
+		}
+		tcpcon, ok := conn.(*net.TCPConn)
+		if ok {
+			log.Println("Disabling TCP keepalive on connection")
+			err := tcpcon.SetKeepAlive(false)
+			if err != nil {
+				log.Println("Error setting SetKeepAlive: ", err)
+			}
 		}
 		tmpDelay = ACCEPT_MIN_SLEEP
 		if !s.startGoRoutine(func() {
